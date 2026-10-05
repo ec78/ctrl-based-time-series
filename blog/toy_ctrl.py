@@ -13,13 +13,15 @@ NOTE: the controller here is a rule-based STAND-IN for the LLM (no API calls are
 `controller_prompt` shows the text a real LLM agent would receive.
 """
 import json
+import os
 import numpy as np
 from statsmodels.tsa.seasonal import STL
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-rng = np.random.default_rng(7)
+rng = np.random.default_rng(int(os.environ.get("SEED", 7)))
+QUIET = bool(os.environ.get("QUIET"))
 P, L, H = 24, 96, 24          # season length, lookback, horizon
 
 # ---------------------------------------------------------------- data
@@ -66,14 +68,15 @@ def backbone(X):
     return np.array(out)
 
 # ---------------------------------------------------------------- component split
+_h = np.arange(H)
+_B = np.stack([np.ones(H), _h, np.sin(2 * np.pi * _h / P), np.cos(2 * np.pi * _h / P)], 1)
 def split(y):
-    """Cheap trend/seasonal/irregular split of a length-H forecast: linear trend,
-    then the mean 24h shape of what is left, then the remainder."""
-    t = np.arange(len(y))
-    tr = np.polyval(np.polyfit(t, y, 1), t)
-    se = y - tr
-    ir = np.zeros_like(y)
-    return tr, se, ir
+    """Split a one-cycle (24-step) window into a trend line and a daily-cycle component by
+    least squares on [1, t, sin, cos]. Returns (trend, seasonal, irregular-remainder)."""
+    c = np.linalg.lstsq(_B, y, rcond=None)[0]
+    tr = _B[:, :2] @ c[:2]
+    se = _B[:, 2:] @ c[2:]
+    return tr, se, y - tr - se
 
 def input_stats(x):
     """Input-only statistics (no labels): trend slope and seasonal dominance from STL."""
@@ -84,12 +87,12 @@ def input_stats(x):
 # ---------------------------------------------------------------- "LLM" controller (stand-in)
 def diagnose(Yhat, Y):
     """Runtime error statistics the LLM would be shown (never raw series or dataset name)."""
-    Th, Sh, _ = zip(*[split(y) for y in Yhat]); Tt, St, _ = zip(*[split(y) for y in Y])
-    slope = lambda T: np.mean([np.polyfit(np.arange(H), t, 1)[0] for t in T])
-    amp = lambda S: np.mean([np.ptp(s) for s in S])
-    return {"trend_slope_pred": slope(Th), "trend_slope_true": slope(Tt),
-            "seas_amp_pred": amp(Sh), "seas_amp_true": amp(St),
-            "mae": float(np.mean(np.abs(Yhat - Y)))}
+    def stats(Z):
+        cs = np.array([np.linalg.lstsq(_B, z, rcond=None)[0] for z in Z])
+        return cs[:, 1].mean(), np.hypot(cs[:, 2], cs[:, 3]).mean()
+    sp, ap = stats(Yhat); st, at = stats(Y)
+    return {"trend_slope_pred": sp, "trend_slope_true": st,
+            "seas_amp_pred": ap, "seas_amp_true": at, "mae": float(np.mean(np.abs(Yhat - Y)))}
 
 def controller_prompt(d):
     return (f"Backbone MAE was {d['mae']:.3f}. Predicted trend slope {d['trend_slope_pred']:.4f} vs "
@@ -160,10 +163,26 @@ pred = {"Backbone only": Yhat_te,
         "CTRL (no adaptation)": apply(Yhat_te, z0, w),
         "CTRL (full, with adaptation)": apply(Yhat_te, z1, w)}
 
+def oracle(Yhat, Y):
+    """Upper bound: the best possible re-scaling of the trend and seasonal parts, with no cap,
+    chosen by peeking at the test answers. Real methods cannot do this."""
+    rows = []
+    for y in Yhat:
+        T, S, _ = split(y)
+        rows.append(np.stack([T - T.mean(), S], 1))
+    F = np.array(rows).reshape(-1, 2)
+    k = np.linalg.lstsq(F, (Y - Yhat).reshape(-1), rcond=None)[0]
+    return Yhat + np.array(rows) @ k
+
+pred["Oracle re-scaling (peeks at answers)"] = oracle(Yhat_te, Yte)
+
 def mse(a, b): return float(np.mean((a - b) ** 2))
 def mae(a, b): return float(np.mean(np.abs(a - b)))
 res = {k: (mse(v, Yte), mae(v, Yte)) for k, v in pred.items()}
 
+if QUIET:
+    print("RESULT", *[f"{v[0]:.5f}" for v in res.values()], f"{shift['trend']:.3f}", f"{shift['seasonal']:.3f}")
+    raise SystemExit
 # ---------------------------------------------------------------- report
 print("=== What the controller was shown (held-out) ===")
 print(controller_prompt(d_val))
@@ -206,9 +225,10 @@ axs[0].set_ylabel("Value")
 fig.suptitle("Same trend, but the daily swing gets much bigger", fontsize=12)
 fig.tight_layout(); fig.savefig("toy_series.png", dpi=160); plt.close(fig)
 
-fig, ax = plt.subplots(figsize=(6.5, 3.6))
+fig, ax = plt.subplots(figsize=(7.5, 3.8))
 names = list(res); vals = [res[k][0] for k in names]
-bars = ax.bar(["Backbone\nonly", "CTRL\n(no adaptation)", "CTRL\n(full)"], vals, color=[C["base"], C["ctrl0"], C["ctrl"]])
+bars = ax.bar(["Backbone\nonly", "CTRL\n(no adaptation)", "CTRL\n(full)", "Oracle\n(upper bound)"], vals,
+              color=[C["base"], C["ctrl0"], C["ctrl"], "#9aa5ad"])
 for b_, v in zip(bars, vals): ax.text(b_.get_x() + b_.get_width() / 2, v, f"{v:.2f}", ha="center", va="bottom")
 ax.set_ylabel("Test MSE (lower is better)"); ax.set_title("Forecast error after the regime change")
 fig.tight_layout(); fig.savefig("toy_mse.png", dpi=160); plt.close(fig)
